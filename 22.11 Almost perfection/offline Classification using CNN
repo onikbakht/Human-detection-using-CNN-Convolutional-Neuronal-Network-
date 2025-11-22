@@ -1,0 +1,223 @@
+import os
+import numpy as np
+import pandas as pd
+import joblib
+import scipy.signal as signal
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import skew
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectFromModel
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from scipy.signal import fftconvolve, butter, filtfilt
+# CNN imports (Keras)
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Dense, Flatten, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Paths
+base_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(base_dir, "splitted data")
+train_file = os.path.join(data_dir, "training_samples.csv")  
+test_file = os.path.join(data_dir, "test_samples.csv")
+#some logs for showing currrent activities
+print("[LOG] Train file path:", train_file)
+print("[LOG] Test file path:", test_file)
+print("[LOG] Train file exists:", os.path.exists(train_file))
+print("[LOG] Test file exists:", os.path.exists(test_file))
+
+
+
+rf_model_path = os.path.join(base_dir, "rf_model.pkl")
+
+# Feature preprocessing
+def autocorrelation(sig):
+    sig = np.array(sig)
+    result = fftconvolve(sig, sig[::-1], mode='full')
+    return result[len(sig)-1:]
+
+def bandpass_filter(signal_data, lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, signal_data)
+
+def preprocess_data(data):
+    processed_data = []
+    for sample in data:
+        sample = np.array(sample)
+        fs = 125_000_000 / 64
+        filtered_sample = bandpass_filter(sample, 30000, 50000, fs)
+        acf_signal = autocorrelation(filtered_sample)
+        windowed_signal = acf_signal * signal.windows.hamming(len(acf_signal))
+        fft_signal = np.abs(np.fft.fft(windowed_signal))[:len(acf_signal) // 2]
+        freq_bins = np.fft.fftfreq(len(acf_signal), d=1/125e6)[:len(acf_signal) // 2]
+        freq_mask = (freq_bins >= 35e3) & (freq_bins <= 45e3)
+        selected_features = fft_signal[freq_mask]
+        selected_freq_bins = freq_bins[freq_mask]
+        selected_features = np.log1p(selected_features)
+
+        spectral_centroid = np.sum(selected_freq_bins * selected_features) / np.sum(selected_features)
+        spectral_flatness = np.exp(np.mean(np.log1p(selected_features))) / np.mean(selected_features)
+        spectral_contrast = np.max(selected_features) - np.min(selected_features)
+
+        mean_val = np.mean(selected_features)
+        std_val = np.std(selected_features)
+        skewness_val = skew(selected_features)
+        spectral_bandwidth = np.sqrt(np.sum((selected_freq_bins - spectral_centroid) ** 2 * selected_features) / np.sum(selected_features))
+        energy = np.sum(sample ** 2)
+
+        
+
+        all_features = np.concatenate((selected_features,[mean_val, std_val, skewness_val,spectral_centroid, spectral_bandwidth, spectral_flatness, spectral_contrast,energy]))
+
+        processed_data.append(all_features)
+
+    return np.array(processed_data)
+
+def load_train_test_data():
+    df_train = pd.read_csv(train_file, header=None)
+    df_test = pd.read_csv(test_file, header=None)
+    print("[LOG] Loaded training data:", df_train.shape)
+    print("[LOG] Loaded test data:", df_test.shape)
+
+
+    X_train = df_train.iloc[:, :-1].values
+    y_train = df_train.iloc[:, -1].values
+    X_test = df_test.iloc[:, :-1].values
+    y_test = df_test.iloc[:, -1].values
+
+    return X_train, X_test, y_train, y_test
+
+# Load and preprocess data
+X_train, X_test, y_train, y_test = load_train_test_data()
+print("[DEBUG] X_train shape:", X_train.shape)
+print("[DEBUG] X_test shape:", X_test.shape)
+
+#debuglog
+
+
+#Some logs for showing numbr of samples, nimber of timesteps, and also number of human or else signals, in each split
+print("[LOG] X_train shape:", X_train.shape)
+print("[LOG] X_test shape:", X_test.shape)
+print("[LOG] y_train distribution:", np.unique(y_train, return_counts=True))
+print("[LOG] y_test distribution:", np.unique(y_test, return_counts=True))
+
+
+# === Simple 1D CNN on raw time-domain signal ===
+
+# 1) Use raw samples (no FFT, no handcrafted features)
+#    Convert to float32 and normalize per sample
+X_train = X_train.astype(np.float32)
+X_test = X_test.astype(np.float32)
+
+# Normalize each waveform independently (per sample)
+X_train = (X_train - X_train.mean(axis=1, keepdims=True)) / \
+          (X_train.std(axis=1, keepdims=True) + 1e-8)
+
+X_test  = (X_test  - X_test.mean(axis=1, keepdims=True)) / \
+          (X_test.std(axis=1, keepdims=True) + 1e-8)
+
+print("[LOG] X_train normalized shape:", X_train.shape)
+print("[LOG] X_test normalized shape:", X_test.shape)
+
+print(f"[INFO] Input shape (raw): {X_train.shape}")  # (n_samples, n_timesteps)
+
+# 2) Reshape for Conv1D: (samples, timesteps, channels)
+X_train_cnn = X_train[..., np.newaxis]  # add channel dimension = 1
+X_test_cnn = X_test[..., np.newaxis]
+
+#some logs for telling us CNN reshapings
+print("[LOG] CNN input shape:", X_train_cnn.shape)
+
+
+input_length = X_train_cnn.shape[1]
+print(f"[INFO] CNN input shape: {X_train_cnn.shape} (samples, timesteps, channels)")
+
+# Ensure labels are 0/1 (binary)
+# Assuming CSV labels are strings: "human" or "else"
+
+
+# Labels are already 0/1 from the splitter
+y_train = y_train.astype(int)
+y_test = y_test.astype(int)
+
+print("[LOG] Unique labels in y_train:", np.unique(y_train))
+print("[LOG] Unique labels in y_test:", np.unique(y_test))
+
+
+
+# 3) Define a simple 1D CNN model
+model = Sequential([
+    Conv1D(16, kernel_size=5, activation='relu', input_shape=(input_length, 1)),
+    MaxPooling1D(pool_size=2),
+
+    Conv1D(32, kernel_size=5, activation='relu'),
+    MaxPooling1D(pool_size=2),
+
+    Flatten(),
+    Dense(64, activation='relu'),
+    Dense(1, activation='sigmoid')  # probability of Person
+])
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss='binary_crossentropy',
+    metrics=['accuracy']
+)
+
+print(model.summary())
+
+# 4) Train the CNN
+early_stop = EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    restore_best_weights=True
+)
+
+#some log to tell us that the system beginns training our CNN
+print("[LOG] Starting CNN training...")
+
+history = model.fit(
+    X_train_cnn,
+    y_train,
+    epochs=30,
+    batch_size=64,
+    validation_split=0.1,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+# 5) Evaluate on test set
+y_pred_prob = model.predict(X_test_cnn).ravel()  # probabilities
+#some log right after the CNN predicts the test set, which shows actual prediction values (the probabilities)
+print("[LOG] First 10 raw predictions:", y_pred_prob[:10])
+
+
+threshold = 0.5  # we can tune this later
+y_pred = (y_pred_prob >= threshold).astype(int)
+
+accuracy = accuracy_score(y_test, y_pred)
+print(f"[RESULT] CNN Accuracy at threshold {threshold:.2f}: {accuracy:.4f}")
+
+# 6) Confusion matrix
+cm = confusion_matrix(y_test, y_pred)
+print("Confusion Matrix (CNN):")
+print(cm)
+
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title(f"Confusion Matrix - CNN (thr={threshold:.2f})")
+plt.show()
+
+# 7) Save model
+cnn_model_path = os.path.join(base_dir, "cnn_model.h5")
+model.save(cnn_model_path)
+print(f"[INFO] CNN model saved to: {cnn_model_path}")
+
+print("CNN training complete.")
+
