@@ -1,0 +1,170 @@
+import os
+import sys
+import csv
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# -----------------------------
+# Paths
+# -----------------------------
+base_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(base_dir, "data")
+output_dir = os.path.join(base_dir, "splitted data")
+os.makedirs(output_dir, exist_ok=True)
+
+train_file = os.path.join(output_dir, "training_samples.csv")
+test_file = os.path.join(output_dir, "test_samples.csv")
+
+TEST_SIZE = 0.25
+RANDOM_STATE = 42
+
+# -----------------------------
+# First pass: scan files, count samples per class
+# -----------------------------
+print("📦 Streaming splitter starting...\n")
+print("🔍 First pass: scanning files and counting samples...")
+
+file_summaries = []   # list of dicts: {path, file, label, n_rows}
+class_counts = {0: 0, 1: 0}
+feature_shape = None
+
+# Make sure we iterate in a deterministic order
+for file in sorted(os.listdir(data_dir)):
+    if not file.endswith(".csv"):
+        continue
+
+    # Determine label from filename
+    if file.startswith("human"):
+        label = 1  # human
+    elif file.startswith("else"):
+        label = 0  # else
+    else:
+        print(f"\033[91m🚨 Skipping file with unexpected name (does not start with 'human' or 'else'): {file}\033[0m")
+        continue
+
+    path = os.path.join(data_dir, file)
+
+    try:
+        df = pd.read_csv(path, header=None)
+        df = df.iloc[:, 17:]  # remove columns A..Q
+
+        # Feature shape consistency check
+        if feature_shape is None:
+            feature_shape = df.shape[1]
+        elif df.shape[1] != feature_shape:
+            print(
+                f"\033[91m⚠️ Skipping {file} due to feature shape mismatch: "
+                f"{df.shape[1]} vs expected {feature_shape}\033[0m"
+            )
+            continue
+
+        n_rows = len(df)
+        class_counts[label] += n_rows
+
+        file_summaries.append({
+            "file": file,
+            "path": path,
+            "label": label,
+            "n_rows": n_rows
+        })
+
+        print(f"✅ {file}: {n_rows} samples → class {label}")
+
+    except Exception as e:
+        print(f"\033[91m❌ Error reading {file}: {e}\033[0m")
+
+print("\n📊 Total samples per class:")
+print(f"   class 0 (else):  {class_counts[0]}")
+print(f"   class 1 (human): {class_counts[1]}")
+
+# Basic safety checks
+total_samples = class_counts[0] + class_counts[1]
+if total_samples == 0:
+    print("\033[91m❌ No usable samples found. Exiting.\033[0m")
+    sys.exit(1)
+
+if class_counts[0] == 0 or class_counts[1] == 0:
+    print("\033[91m❌ Only one class present. Stratified split is not possible.\033[0m")
+    sys.exit(1)
+
+# -----------------------------
+# Build per-class train/test index assignments
+# -----------------------------
+print("\n🧮 Building stratified train/test assignment per class...")
+
+is_test_index = {}   # label -> set of indices that go to test
+for label in (0, 1):
+    n = class_counts[label]
+    indices = np.arange(n)
+
+    # Use sklearn's train_test_split on indices to get a similar behavior
+    train_idx, test_idx = train_test_split(
+        indices,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        shuffle=True
+    )
+
+    is_test_index[label] = set(test_idx)
+    print(
+        f"   Class {label}: total {n}, "
+        f"train {len(train_idx)}, test {len(test_idx)}"
+    )
+
+# -----------------------------
+# Second pass: stream rows and write them to train/test CSVs
+# -----------------------------
+print("\n🚚 Second pass: streaming data and writing train/test CSVs...")
+
+# Open output CSVs
+with open(train_file, "w", newline="") as f_train, open(test_file, "w", newline="") as f_test:
+    train_writer = csv.writer(f_train)
+    test_writer = csv.writer(f_test)
+
+    # Keep track of how many samples we've seen per class
+    class_running_index = {0: 0, 1: 0}
+
+    for summary in file_summaries:
+        file = summary["file"]
+        path = summary["path"]
+        label = summary["label"]
+        n_rows = summary["n_rows"]
+
+        try:
+            df = pd.read_csv(path, header=None)
+            df = df.iloc[:, 17:]  # same column trimming as in first pass
+            data = df.values
+
+            if data.shape[1] != feature_shape:
+                print(
+                    f"\033[91m⚠️ Skipping {file} in second pass due to shape mismatch: "
+                    f"{data.shape[1]} vs expected {feature_shape}\033[0m"
+                )
+                continue
+
+            print(f"   📄 Processing {file} ({n_rows} samples, class {label})...")
+            current_idx = class_running_index[label]
+
+            # For each sample in this file
+            for i in range(n_rows):
+                global_idx = current_idx + i  # index within this class
+                row = data[i]
+
+                # Decide whether this row goes to test or train
+                if global_idx in is_test_index[label]:
+                    # test sample
+                    test_writer.writerow(list(row) + [label])
+                else:
+                    # train sample
+                    train_writer.writerow(list(row) + [label])
+
+            # Update running index
+            class_running_index[label] += n_rows
+
+        except Exception as e:
+            print(f"\033[91m❌ Error re-reading {file} in second pass: {e}\033[0m")
+
+print("\n✅ Done. Train and test sets saved in 'splitted data/'")
+print(f"   → {train_file}")
+print(f"   → {test_file}")
